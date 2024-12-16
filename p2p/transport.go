@@ -62,7 +62,7 @@ func (t *rlpxTransport) ReadMsg() (Msg, error) {
 
 	var msg Msg
 	t.conn.SetReadDeadline(time.Now().Add(frameReadTimeout))
-	code, data, wireSize, err := t.conn.Read()
+	code, data, wireSize, elapsed, rn, err := t.conn.Read()
 	if err == nil {
 		// Protocol messages are dispatched to subprotocol handlers asynchronously,
 		// but package rlpx may reuse the returned 'data' buffer on the next call
@@ -74,6 +74,8 @@ func (t *rlpxTransport) ReadMsg() (Msg, error) {
 			Size:       uint32(len(data)),
 			meterSize:  uint32(wireSize),
 			Payload:    bytes.NewReader(data),
+			Elapsed:    elapsed,
+			Bytes:      rn,
 		}
 	}
 	return msg, err

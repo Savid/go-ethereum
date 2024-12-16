@@ -22,6 +22,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
@@ -127,18 +128,18 @@ func (c *Conn) SetDeadline(time time.Time) error {
 
 // Read reads a message from the connection.
 // The returned data buffer is valid until the next call to Read.
-func (c *Conn) Read() (code uint64, data []byte, wireSize int, err error) {
+func (c *Conn) Read() (code uint64, data []byte, wireSize int, elapsed time.Duration, bytes int, err error) {
 	if c.session == nil {
 		panic("can't ReadMsg before handshake")
 	}
 
 	frame, err := c.session.readFrame(c.conn)
 	if err != nil {
-		return 0, nil, 0, err
+		return 0, nil, 0, 0, 0, err
 	}
-	code, data, err = rlp.SplitUint64(frame)
+	code, data, err = rlp.SplitUint64(frame.data)
 	if err != nil {
-		return 0, nil, 0, fmt.Errorf("invalid message code: %v", err)
+		return 0, nil, 0, 0, 0, fmt.Errorf("invalid message code: %v", err)
 	}
 	wireSize = len(data)
 
@@ -147,35 +148,35 @@ func (c *Conn) Read() (code uint64, data []byte, wireSize int, err error) {
 		var actualSize int
 		actualSize, err = snappy.DecodedLen(data)
 		if err != nil {
-			return code, nil, 0, err
+			return code, nil, 0, 0, 0, err
 		}
 		if actualSize > maxUint24 {
-			return code, nil, 0, errPlainMessageTooLarge
+			return code, nil, 0, 0, 0, errPlainMessageTooLarge
 		}
 		c.snappyReadBuffer = growslice(c.snappyReadBuffer, actualSize)
 		data, err = snappy.Decode(c.snappyReadBuffer, data)
 	}
-	return code, data, wireSize, err
+	return code, data, wireSize, frame.elapsed, frame.bytes, err
 }
 
-func (h *sessionState) readFrame(conn io.Reader) ([]byte, error) {
+func (h *sessionState) readFrame(conn io.Reader) (readResult, error) {
 	h.rbuf.reset()
 
 	// Read the frame header.
 	header, err := h.rbuf.read(conn, 32)
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
 
 	// Verify header MAC.
-	wantHeaderMAC := h.ingressMAC.computeHeader(header[:16])
-	if !hmac.Equal(wantHeaderMAC, header[16:]) {
-		return nil, errors.New("bad header MAC")
+	wantHeaderMAC := h.ingressMAC.computeHeader(header.data[:16])
+	if !hmac.Equal(wantHeaderMAC, header.data[16:]) {
+		return readResult{}, errors.New("bad header MAC")
 	}
 
 	// Decrypt the frame header to get the frame size.
-	h.dec.XORKeyStream(header[:16], header[:16])
-	fsize := readUint24(header[:16])
+	h.dec.XORKeyStream(header.data[:16], header.data[:16])
+	fsize := readUint24(header.data[:16])
 	// Frame size rounded up to 16 byte boundary for padding.
 	rsize := fsize
 	if padding := fsize % 16; padding > 0 {
@@ -185,22 +186,26 @@ func (h *sessionState) readFrame(conn io.Reader) ([]byte, error) {
 	// Read the frame content.
 	frame, err := h.rbuf.read(conn, int(rsize))
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
 
 	// Validate frame MAC.
 	frameMAC, err := h.rbuf.read(conn, 16)
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
-	wantFrameMAC := h.ingressMAC.computeFrame(frame)
-	if !hmac.Equal(wantFrameMAC, frameMAC) {
-		return nil, errors.New("bad frame MAC")
+	wantFrameMAC := h.ingressMAC.computeFrame(frame.data)
+	if !hmac.Equal(wantFrameMAC, frameMAC.data) {
+		return readResult{}, errors.New("bad frame MAC")
 	}
 
 	// Decrypt the frame data.
-	h.dec.XORKeyStream(frame, frame)
-	return frame[:fsize], nil
+	h.dec.XORKeyStream(frame.data, frame.data)
+	return readResult{
+		data:    frame.data[:fsize],
+		elapsed: frame.elapsed,
+		bytes:   frame.bytes,
+	}, nil
 }
 
 // Write writes a message to the connection.
@@ -432,7 +437,7 @@ func (h *handshakeState) runRecipient(conn io.ReadWriter, prv *ecdsa.PrivateKey)
 		return s, err
 	}
 
-	return h.secrets(authPacket, authRespPacket)
+	return h.secrets(authPacket.data, authRespPacket)
 }
 
 func (h *handshakeState) handleAuthMsg(msg *authMsgV4, prv *ecdsa.PrivateKey) error {
@@ -536,7 +541,7 @@ func (h *handshakeState) runInitiator(conn io.ReadWriter, prv *ecdsa.PrivateKey,
 		return s, err
 	}
 
-	return h.secrets(authPacket, authRespPacket)
+	return h.secrets(authPacket, authRespPacket.data)
 }
 
 // makeAuthMsg creates the initiator handshake message.
@@ -593,36 +598,35 @@ func (h *handshakeState) makeAuthResp() (msg *authRespV4, err error) {
 }
 
 // readMsg reads an encrypted handshake message, decoding it into msg.
-func (h *handshakeState) readMsg(msg interface{}, prv *ecdsa.PrivateKey, r io.Reader) ([]byte, error) {
+func (h *handshakeState) readMsg(msg interface{}, prv *ecdsa.PrivateKey, r io.Reader) (readResult, error) {
 	h.rbuf.reset()
 	h.rbuf.grow(512)
 
 	// Read the size prefix.
 	prefix, err := h.rbuf.read(r, 2)
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
-	size := binary.BigEndian.Uint16(prefix)
-
-	// baseProtocolMaxMsgSize = 2 * 1024
-	if size > 2048 {
-		return nil, errors.New("message too big")
-	}
+	size := binary.BigEndian.Uint16(prefix.data)
 
 	// Read the handshake packet.
 	packet, err := h.rbuf.read(r, int(size))
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
-	dec, err := ecies.ImportECDSA(prv).Decrypt(packet, nil, prefix)
+	dec, err := ecies.ImportECDSA(prv).Decrypt(packet.data, nil, prefix.data)
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
 	// Can't use rlp.DecodeBytes here because it rejects
 	// trailing data (forward-compatibility).
 	s := rlp.NewStream(bytes.NewReader(dec), 0)
 	err = s.Decode(msg)
-	return h.rbuf.data[:len(prefix)+len(packet)], err
+	return readResult{
+		data:    h.rbuf.data[:len(prefix.data)+len(packet.data)],
+		elapsed: packet.elapsed,
+		bytes:   packet.bytes,
+	}, err
 }
 
 // sealEIP8 encrypts a handshake message.
@@ -668,10 +672,7 @@ func exportPubkey(pub *ecies.PublicKey) []byte {
 	if pub == nil {
 		panic("nil pubkey")
 	}
-	if curve, ok := pub.Curve.(crypto.EllipticCurve); ok {
-		return curve.Marshal(pub.X, pub.Y)[1:]
-	}
-	return []byte{}
+	return elliptic.Marshal(pub.Curve, pub.X, pub.Y)[1:]
 }
 
 func xor(one, other []byte) (xor []byte) {

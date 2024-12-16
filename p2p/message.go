@@ -41,6 +41,8 @@ type Msg struct {
 	Size       uint32 // Size of the raw payload
 	Payload    io.Reader
 	ReceivedAt time.Time
+	Elapsed    time.Duration
+	Bytes      int
 
 	meterCap  Cap    // Protocol name and version for egress metering
 	meterCode uint64 // Message within protocol for egress metering

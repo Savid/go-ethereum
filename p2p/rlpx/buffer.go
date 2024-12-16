@@ -18,6 +18,7 @@ package rlpx
 
 import (
 	"io"
+	"time"
 )
 
 // readBuffer implements buffering for network reads. This type is similar to bufio.Reader,
@@ -44,30 +45,47 @@ func (b *readBuffer) reset() {
 	b.data = b.data[:0]
 }
 
+type readResult struct {
+	data    []byte
+	elapsed time.Duration
+	bytes   int
+}
+
 // read reads at least n bytes from r, returning the bytes.
 // The returned slice is valid until the next call to reset.
-func (b *readBuffer) read(r io.Reader, n int) ([]byte, error) {
+func (b *readBuffer) read(r io.Reader, n int) (readResult, error) {
 	offset := len(b.data)
 	have := b.end - len(b.data)
 
 	// If n bytes are available in the buffer, there is no need to read from r at all.
 	if have >= n {
 		b.data = b.data[:offset+n]
-		return b.data[offset : offset+n], nil
+		return readResult{
+			data:    b.data[offset : offset+n],
+			elapsed: 0,
+			bytes:   0,
+		}, nil
 	}
 
 	// Make buffer space available.
 	need := n - have
 	b.grow(need)
 
-	// Read.
+	start := time.Now()
 	rn, err := io.ReadAtLeast(r, b.data[b.end:cap(b.data)], need)
+	elapsed := time.Since(start)
+
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
+
 	b.end += rn
 	b.data = b.data[:offset+n]
-	return b.data[offset : offset+n], nil
+	return readResult{
+		data:    b.data[offset : offset+n],
+		elapsed: elapsed,
+		bytes:   rn,
+	}, nil
 }
 
 // grow ensures the buffer has at least n bytes of unused space.
