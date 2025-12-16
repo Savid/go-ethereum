@@ -42,11 +42,12 @@ type Storage map[common.Hash]common.Hash
 
 // Config are the configuration options for structured logger the EVM
 type Config struct {
-	EnableMemory     bool // enable memory capture
-	DisableStack     bool // disable stack capture
-	DisableStorage   bool // disable storage capture
-	EnableReturnData bool // enable return data capture
-	Limit            int  // maximum size of output, but zero means unlimited
+	EnableMemory         bool // enable memory capture
+	DisableStack         bool // disable stack capture
+	DisableStorage       bool // disable storage capture
+	EnableReturnData     bool // enable return data capture
+	ComputeActualGasCost bool // compute actual gas cost from consecutive gas values
+	Limit                int  // maximum size of output, but zero means unlimited
 	// Chain overrides, can be used to execute a trace using future fork rules
 	Overrides *params.ChainConfig `json:"overrides,omitempty"`
 }
@@ -216,9 +217,10 @@ type StructLogger struct {
 	err     error
 	usedGas uint64
 
-	writer     io.Writer         // If set, the logger will stream instead of store logs
-	logs       []json.RawMessage // buffer of json-encoded logs
-	resultSize int
+	writer      io.Writer         // If set, the logger will stream instead of store logs
+	logs        []json.RawMessage // buffer of json-encoded logs
+	pendingLogs []*StructLog      // pending logs per depth for actual gas computation
+	resultSize  int
 
 	interrupt atomic.Bool // Atomic flag to signal execution interruption
 	reason    error       // Textual reason for the interruption
@@ -319,9 +321,36 @@ func (l *StructLogger) OnOpcode(pc uint64, opcode byte, gas, cost uint64, scope 
 
 	// create a log
 	if l.writer == nil {
-		entry := log.toLegacyJSON()
-		l.resultSize += len(entry)
-		l.logs = append(l.logs, entry)
+		if l.cfg.ComputeActualGasCost {
+			// Ensure pendingLogs slice is large enough for this depth
+			for len(l.pendingLogs) <= depth {
+				l.pendingLogs = append(l.pendingLogs, nil)
+			}
+			// Flush any pending logs from deeper levels (we've returned from calls)
+			for d := len(l.pendingLogs) - 1; d > depth; d-- {
+				if l.pendingLogs[d] != nil {
+					// Use current gas to compute actual cost for returned call
+					l.pendingLogs[d].GasCost = l.pendingLogs[d].Gas - gas
+					entry := l.pendingLogs[d].toLegacyJSON()
+					l.resultSize += len(entry)
+					l.logs = append(l.logs, entry)
+					l.pendingLogs[d] = nil
+				}
+			}
+			// Flush pending log at current depth with actual gas cost
+			if l.pendingLogs[depth] != nil {
+				l.pendingLogs[depth].GasCost = l.pendingLogs[depth].Gas - gas
+				entry := l.pendingLogs[depth].toLegacyJSON()
+				l.resultSize += len(entry)
+				l.logs = append(l.logs, entry)
+			}
+			// Store current log as pending at this depth
+			l.pendingLogs[depth] = &log
+		} else {
+			entry := log.toLegacyJSON()
+			l.resultSize += len(entry)
+			l.logs = append(l.logs, entry)
+		}
 		return
 	}
 	log.Write(l.writer)
@@ -357,6 +386,16 @@ func (l *StructLogger) GetResult() (json.RawMessage, error) {
 	if failed && !errors.Is(l.err, vm.ErrExecutionReverted) {
 		returnData = []byte{}
 	}
+
+	// Flush any pending logs (last opcode at each depth keeps pre-calculated cost)
+	for d := range l.pendingLogs {
+		if l.pendingLogs[d] != nil {
+			entry := l.pendingLogs[d].toLegacyJSON()
+			l.logs = append(l.logs, entry)
+			l.pendingLogs[d] = nil
+		}
+	}
+
 	return json.Marshal(&ExecutionResult{
 		Gas:         l.usedGas,
 		Failed:      failed,
